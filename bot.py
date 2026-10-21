@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """telegram-agent - talk to the local engine from Telegram.
 
-The bot talks to the bmoe-server that runs on this phone
-(http://127.0.0.1:8765/v1), so nothing leaves the device: the phone reads the
-text, the engine answers, the phone sends the answer back.
+The bot is a client of the OpenAI-compatible server that `ai go` starts on
+this phone (http://127.0.0.1:8765/v1), so nothing leaves the device: the
+phone holds the model, the text and the answer.
+
+Only the standard library is used for the API calls on purpose: the `openai`
+package needs a Rust toolchain to build on Termux, and the phone should not
+need one to talk to itself.
 
 Configuration (~/ai/etc/ai.env, or the environment):
     AI_TELEGRAM_TOKEN     bot token from @BotFather
@@ -12,11 +16,14 @@ Configuration (~/ai/etc/ai.env, or the environment):
     AI_MODEL_NAME        model name the server exposes (default: local)
 """
 
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 AI_ROOT = Path(os.environ.get("AI_ROOT", Path.home() / "ai"))
@@ -26,7 +33,7 @@ AI_ENV = AI_ROOT / "etc" / "ai.env"
 def load_env_file(path: Path) -> None:
     """Read KEY=VALUE pairs from a shell-style env file into os.environ.
 
-    Values already in the environment win: the file is a default, not an
+    A value already in the environment wins: the file is a default, not an
     override.
     """
     if not path.exists():
@@ -48,6 +55,7 @@ TOKEN = os.environ.get("AI_TELEGRAM_TOKEN", "").strip()
 ALLOWED_USER_ID = os.environ.get("AI_TELEGRAM_USER_ID", "").strip()
 BASE_URL = os.environ.get("AI_BASE_URL", "http://127.0.0.1:8765/v1").rstrip("/")
 MODEL = os.environ.get("AI_MODEL_NAME", "local")
+API_KEY = os.environ.get("AI_API_KEY", "local")
 WHISPER_BIN = os.environ.get("AI_WHISPER_BIN", "").strip()
 WHISPER_MODEL = os.environ.get("AI_WHISPER_MODEL", "").strip()
 
@@ -63,11 +71,44 @@ try:
         ContextTypes,
         filters,
     )
-    from openai import OpenAI
 except ImportError as exc:  # pragma: no cover - the phone installs these
-    sys.exit("missing python package (%s): pip install python-telegram-bot openai" % exc)
+    sys.exit("missing python package (%s): pip install python-telegram-bot" % exc)
 
-client = OpenAI(base_url=BASE_URL, api_key=os.environ.get("AI_API_KEY", "local"), timeout=600)
+
+def stream_chat(prompt: str, history=None):
+    """Yield the answer as it arrives, from the local engine."""
+    body = json.dumps(
+        {
+            "model": MODEL,
+            "messages": (history or []) + [{"role": "user", "content": prompt}],
+            "stream": True,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        BASE_URL + "/chat/completions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + API_KEY,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=1800) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            for choice in chunk.get("choices", []):
+                piece = (choice.get("delta") or {}).get("content")
+                if piece:
+                    yield piece
 
 
 def allowed(update: Update) -> bool:
@@ -90,7 +131,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await say(
         update,
         "Local engine online.\n"
-        "Send a message and I will answer from the model running on this phone.\n"
+        "Send a message and I answer from the model running on this phone.\n"
         "/stop - stop the engine\n/status - what is running\n/help - this list",
     )
 
@@ -164,26 +205,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def answer(update: Update, prompt: str) -> None:
     """Ask the local engine and send the answer back, in chunks."""
     status = await update.effective_message.reply_text("thinking...")
-    try:
-        stream = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            stream=True,
-        )
-    except Exception as exc:
-        await status.edit_text(f"The engine did not answer: {exc}")
-        return
-
     parts = []
     started = time.time()
     try:
-        for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            piece = getattr(delta, "content", None)
-            if piece:
-                parts.append(piece)
+        for piece in stream_chat(prompt):
+            parts.append(piece)
+    except urllib.error.URLError as exc:
+        await status.edit_text(f"The engine is not answering: {exc}")
+        return
     except Exception as exc:
         await status.edit_text(f"The engine stopped mid-answer: {exc}")
         return
@@ -194,10 +223,10 @@ async def answer(update: Update, prompt: str) -> None:
         await status.edit_text("The engine answered with nothing.")
         return
     header = f"({elapsed:.1f}s)\n\n"
-    await status.edit_text((header + text)[:4000])
-    if len(header + text) > 4000:
-        for i in range(4000, len(header + text), 4000):
-            await update.effective_message.reply_text((header + text)[i : i + 4000])
+    body = header + text
+    await status.edit_text(body[:4000])
+    for i in range(4000, len(body), 4000):
+        await update.effective_message.reply_text(body[i : i + 4000])
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
